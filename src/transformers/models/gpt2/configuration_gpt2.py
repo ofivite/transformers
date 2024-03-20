@@ -68,8 +68,16 @@ class GPT2Config(PretrainedConfig):
             The dropout ratio for the embeddings.
         attn_pdrop (`float`, *optional*, defaults to 0.1):
             The dropout ratio for the attention.
+        learnable_layer_norm (`bool`, *optional*, defaults to `False`):
+            Whether or not to learn the layer normalization parameters.
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
             The epsilon to use in the layer normalization layers.
+        init_output_to_zero (`bool`, *optional*, defaults to `False`):
+            Whether to intialize the projection weights of the last layer with zeros.
+        init_std (`float`, *optional*, defaults to 0.01):
+            The standard deviation of the normal distribution for initializing Linear/Conv1D matrices.
+        emb_init_std (`float`, *optional*, defaults to 0.01):
+            The standard deviation of the normal distribution for initializing the embedding matrices.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         summary_type (`string`, *optional*, defaults to `"cls_index"`):
@@ -116,7 +124,10 @@ class GPT2Config(PretrainedConfig):
         reorder_and_upcast_attn (`bool`, *optional*, defaults to `False`):
             Whether to scale keys (K) prior to computing attention (dot-product) and upcast attention
             dot-product/softmax to float() when training with mixed precision.
-
+        attn_mult (`float`, *optional*, defaults to `None`):
+            The factor by which the attention weights are multiplied before softmax. If None, defaults to 1. (1/sqrt(d_head) is applied in modeling_gpt2.py)
+        logit_scale (`float`, *optional*, defaults to `None`):
+            The factor by which the output logits are multiplied. If None, defaults to 1.0.
     Example:
 
     ```python
@@ -154,6 +165,10 @@ class GPT2Config(PretrainedConfig):
         embd_pdrop=0.1,
         attn_pdrop=0.1,
         layer_norm_epsilon=1e-5,
+        learnable_layer_norm=False,
+        init_output_to_zero=False,
+        init_std=0.01,
+        emb_init_std=0.01,
         initializer_range=0.02,
         summary_type="cls_index",
         summary_use_proj=True,
@@ -166,6 +181,8 @@ class GPT2Config(PretrainedConfig):
         eos_token_id=50256,
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
+        attn_mult=None,
+        logit_scale=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -179,6 +196,10 @@ class GPT2Config(PretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attn_pdrop = attn_pdrop
         self.layer_norm_epsilon = layer_norm_epsilon
+        self.learnable_layer_norm = learnable_layer_norm
+        self.init_output_to_zero = init_output_to_zero
+        self.init_std = init_std
+        self.emb_init_std = emb_init_std
         self.initializer_range = initializer_range
         self.summary_type = summary_type
         self.summary_use_proj = summary_use_proj
@@ -193,6 +214,17 @@ class GPT2Config(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
+        if attn_mult is None:
+            # defaults to 1/sqrt(d_head)
+            self.attn_mult = 1.0
+        else:
+            self.attn_mult = attn_mult
+
+        if logit_scale is not None:
+            logit_scale = 1.0
+        else:
+            self.logit_scale = logit_scale
+        
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
 

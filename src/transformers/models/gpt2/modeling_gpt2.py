@@ -148,6 +148,7 @@ class GPT2Attention(nn.Module):
         self.is_cross_attention = is_cross_attention
 
         # Layer-wise attention scaling, reordering, and upcasting
+        self.attn_mult = config.attn_mult
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
@@ -183,7 +184,7 @@ class GPT2Attention(nn.Module):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
-            attn_weights = attn_weights / torch.full(
+            attn_weights = attn_weights * self.attn_mult / torch.full(
                 [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
             )
 
@@ -230,6 +231,7 @@ class GPT2Attention(nn.Module):
         # Compute Scale Factor
         scale_factor = 1.0
         if self.scale_attn_weights:
+            scale_factor *= self.attn_mult
             scale_factor /= float(value.size(-1)) ** 0.5
 
         if self.scale_attn_by_inverse_layer_idx:
@@ -364,13 +366,24 @@ class GPT2Block(nn.Module):
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        if config.learnable_layer_norm:
+            self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=True, bias=True)
+        else:
+            self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=False, bias=False)
+        
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        
+        if config.learnable_layer_norm:
+            self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=True, bias=True)
+        else:
+            self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=False, bias=False)
 
         if config.add_cross_attention:
             self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
-            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            if config.learnable_layer_norm:
+                self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=True, bias=True)
+            else:
+                self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon, elementwise_affine=False, bias=False)
 
         self.mlp = GPT2MLP(inner_dim, config)
 
@@ -458,16 +471,30 @@ class GPT2PreTrainedModel(PreTrainedModel):
         if isinstance(module, (nn.Linear, Conv1D)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if hasattr(module, '_is_unembedding'): # applied for `self.lm_head`
+                if module._is_unembedding:
+                    if self.config.init_output_to_zero:
+                        if not self.config.tie_word_embeddings:
+                            module.weight.data.zero_() # init to 0 to remove 1/sqrt(d_model) scaling, see https://github.com/microsoft/mup/issues?tab=readme-ov-file#making-your-own-coord-check-plots
+                        else:
+                            raise ValueError("Zero init of output unembedding is not supported when tie_word_embeddings is True")
+                    else:
+                        module.weight.data.normal_(mean=0.0, std=self.config.emb_init_std)
+                else:
+                    raise ValueError("Unembedding layer should have _is_unembedding attribute set to True")
+            else:
+                module.weight.data.normal_(mean=0.0, std=self.config.init_std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.config.emb_init_std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+            if hasattr(module, 'weight') and isinstance(module.weight, torch.Tensor):
+                torch.nn.init.ones_(module.weight)
+            if hasattr(module, 'bias') and isinstance(module.bias, torch.Tensor):
+                torch.nn.init.zeros_(module.bias)
 
         # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
         #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
@@ -673,7 +700,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        if config.learnable_layer_norm:
+            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon, elementwise_affine=True, bias=True)
+        else:
+            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon, elementwise_affine=False, bias=False)
 
         # Model parallel
         self.model_parallel = False
@@ -948,6 +978,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         super().__init__(config)
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head._is_unembedding = True
+        self.logit_scale = config.logit_scale
 
         # Model parallel
         self.model_parallel = False
@@ -1094,6 +1126,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
+        if self.logit_scale is not None:
+            lm_logits *= self.logit_scale
 
         loss = None
         if labels is not None:
@@ -1156,6 +1190,8 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+
+        raise NotImplementedError('muP is not supported for GPT2DoubleHeadsModel.')
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1391,6 +1427,8 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
 
+        raise NotImplementedError('muP is not supported for GPT2ForSequenceClassification.')
+    
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1525,6 +1563,8 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
 
+        raise NotImplementedError('muP is not supported for GPT2ForTokenClassification.')
+    
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1628,6 +1668,8 @@ class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
 
+        raise NotImplementedError('muP is not supported for GPT2ForQuestionAnswering.')
+    
         # Initialize weights and apply final processing
         self.post_init()
 
