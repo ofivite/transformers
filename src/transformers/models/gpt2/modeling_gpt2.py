@@ -26,6 +26,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn.functional import scaled_dot_product_attention
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -160,6 +161,7 @@ class GPT2Attention(nn.Module):
             self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
+        self.attn_dropout_value = config.attn_pdrop
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
@@ -330,7 +332,13 @@ class GPT2Attention(nn.Module):
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
         else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+            with torch.backends.cuda.sdp_kernel(enable_math=False):
+                attn_output = scaled_dot_product_attention(query, key, value,
+                                                        attn_mask=attention_mask,
+                                                        dropout_p=self.attn_dropout_value,
+                                                        is_causal=True,
+                                                        scale=self.attn_mult / value.size(-1) ** 0.5)
+            attn_weights = None
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
